@@ -1,44 +1,30 @@
 const Database = require('better-sqlite3');
 const path = require('path');
 const { app } = require('electron');
+const { runMigrations } = require('./migrations');
 
 let db;
+
+class AppError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'AppError';
+  }
+}
 
 function init() {
   db = new Database(path.join(app.getPath('userData'), 'kitabi.db'));
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS books (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      title TEXT NOT NULL,
-      author TEXT NOT NULL,
-      isbn TEXT,
-      category TEXT,
-      copies INTEGER NOT NULL DEFAULT 1 CHECK (copies >= 0),
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE TABLE IF NOT EXISTS members (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      phone TEXT,
-      email TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE TABLE IF NOT EXISTS loans (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE RESTRICT,
-      member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE RESTRICT,
-      loan_date TEXT NOT NULL,
-      due_date TEXT NOT NULL,
-      return_date TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_loans_active ON loans(return_date);
-  `);
+  runMigrations(db);
   return db;
 }
 
-const today = () => new Date().toISOString().slice(0, 10);
+function close() {
+  if (db) db.close();
+}
+
+const today = () => new Date().toLocaleDateString('en-CA');
 
 function booksList(q = '') {
   const like = `%${q}%`;
@@ -50,15 +36,28 @@ function booksList(q = '') {
     .all(like, like, like);
 }
 
+const activeLoansOf = (bookId) =>
+  db.prepare('SELECT COUNT(*) AS n FROM loans WHERE book_id = ? AND return_date IS NULL').get(bookId).n;
+
 function booksSave(b) {
-  if (b.id) {
-    db.prepare('UPDATE books SET title=?, author=?, isbn=?, category=?, copies=? WHERE id=?').run(
-      b.title, b.author, b.isbn, b.category, Number(b.copies) || 1, b.id
-    );
-  } else {
-    db.prepare('INSERT INTO books (title, author, isbn, category, copies) VALUES (?,?,?,?,?)').run(
-      b.title, b.author, b.isbn, b.category, Number(b.copies) || 1
-    );
+  try {
+    if (b.id) {
+      const active = activeLoansOf(b.id);
+      if (b.copies < active) {
+        throw new AppError(`لا يمكن تقليل النسخ إلى أقل من النسخ المعارة حاليًا (${active})`);
+      }
+      const info = db
+        .prepare('UPDATE books SET title=?, author=?, isbn=?, category=?, copies=? WHERE id=?')
+        .run(b.title, b.author, b.isbn, b.category, b.copies, b.id);
+      if (info.changes === 0) throw new AppError('الكتاب غير موجود');
+    } else {
+      db.prepare('INSERT INTO books (title, author, isbn, category, copies) VALUES (?,?,?,?,?)').run(
+        b.title, b.author, b.isbn, b.category, b.copies
+      );
+    }
+  } catch (e) {
+    if (e.code === 'SQLITE_CONSTRAINT_UNIQUE') throw new AppError('رقم ISBN مستخدم مسبقًا لكتاب آخر');
+    throw e;
   }
   return true;
 }
@@ -72,7 +71,10 @@ function membersList(q = '') {
 
 function membersSave(m) {
   if (m.id) {
-    db.prepare('UPDATE members SET name=?, phone=?, email=? WHERE id=?').run(m.name, m.phone, m.email, m.id);
+    const info = db
+      .prepare('UPDATE members SET name=?, phone=?, email=? WHERE id=?')
+      .run(m.name, m.phone, m.email, m.id);
+    if (info.changes === 0) throw new AppError('العضو غير موجود');
   } else {
     db.prepare('INSERT INTO members (name, phone, email) VALUES (?,?,?)').run(m.name, m.phone, m.email);
   }
@@ -89,18 +91,31 @@ function loansList() {
     .all();
 }
 
-function loansCreate({ book_id, member_id, due_date }) {
-  const book = booksList('').find((b) => b.id === Number(book_id));
-  if (!book) throw new Error('الكتاب غير موجود');
-  if (book.available <= 0) throw new Error('لا توجد نسخ متاحة من هذا الكتاب');
-  db.prepare('INSERT INTO loans (book_id, member_id, loan_date, due_date) VALUES (?,?,?,?)').run(
-    book_id, member_id, today(), due_date
-  );
+const createLoanTx = (data) =>
+  db.transaction(({ book_id, member_id, due_date }) => {
+    const book = db.prepare('SELECT copies FROM books WHERE id = ?').get(book_id);
+    if (!book) throw new AppError('الكتاب غير موجود');
+    const member = db.prepare('SELECT id FROM members WHERE id = ?').get(member_id);
+    if (!member) throw new AppError('العضو غير موجود');
+    if (due_date < today()) throw new AppError('تاريخ الإرجاع يجب أن يكون من اليوم فما بعد');
+    if (book.copies - activeLoansOf(book_id) <= 0) {
+      throw new AppError('لا توجد نسخ متاحة من هذا الكتاب');
+    }
+    db.prepare('INSERT INTO loans (book_id, member_id, loan_date, due_date) VALUES (?,?,?,?)').run(
+      book_id, member_id, today(), due_date
+    );
+  }).immediate(data);
+
+function loansCreate(data) {
+  createLoanTx(data);
   return true;
 }
 
 function loansReturn(id) {
-  db.prepare('UPDATE loans SET return_date = ? WHERE id = ? AND return_date IS NULL').run(today(), id);
+  const info = db
+    .prepare('UPDATE loans SET return_date = ? WHERE id = ? AND return_date IS NULL')
+    .run(today(), id);
+  if (info.changes === 0) throw new AppError('الإعارة غير موجودة أو أُرجعت مسبقًا');
   return true;
 }
 
@@ -116,17 +131,19 @@ function stats() {
 }
 
 function remove(table, id) {
-  const allowed = ['books', 'members'];
-  if (!allowed.includes(table)) throw new Error('invalid table');
+  if (!['books', 'members'].includes(table)) throw new AppError('invalid table');
   try {
     db.prepare(`DELETE FROM ${table} WHERE id = ?`).run(id);
   } catch (e) {
-    throw new Error('لا يمكن الحذف: السجل مرتبط بعمليات إعارة');
+    if (String(e.code).startsWith('SQLITE_CONSTRAINT')) {
+      throw new AppError('لا يمكن الحذف: السجل مرتبط بعمليات إعارة');
+    }
+    throw e;
   }
   return true;
 }
 
 module.exports = {
-  init, booksList, booksSave, membersList, membersSave,
+  AppError, init, close, booksList, booksSave, membersList, membersSave,
   loansList, loansCreate, loansReturn, stats, remove,
 };
