@@ -1,0 +1,21 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Segoe UI", Tahoma, system-ui, sans-serif;
+  --color-brand-400: #34d399;
+  --color-brand-500: #10b981;
+  --color-brand-600: #059669;
+}
+
+html, body, #root { height: 100%; }
+body { @apply bg-slate-950 text-slate-100 antialiased; }
+
+.input {
+  @apply w-full rounded-xl border border-slate-700 bg-slate-900 px-3 py-2 text-sm outline-none transition focus:border-brand-500;
+}
+.btn {
+  @apply rounded-xl bg-brand-500 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-brand-400 cursor-pointer;
+}
+.btn-ghost {
+  @apply rounded-xl border border-slate-700 px-3 py-1.5 text-xs transition hover:bg-slate-800 cursor-pointer;
+}
